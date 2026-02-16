@@ -353,12 +353,29 @@ def serialize_value(value, key=None):
         }
         return vlan_mode_map.get(value, value)
 
+    # Normalize VLAN IDs to string so "1" and 1 compare equal in check_mode
+    if key in ("vlan_access", "native_vlan_id", "vlan_tag") and value is not None:
+        if hasattr(value, "id"):
+            return str(value.id)
+        return str(value)
+
+    # API may return port_access_onboarding_precedence with int keys; normalize to string keys for comparison
+    if key == "port_access_onboarding_precedence" and isinstance(value, dict):
+        return {str(k): serialize_value(v, k) for k, v in value.items()}
+
     if isinstance(value, dict):
         # Recursively serialize dict values
         return {k: serialize_value(v, k) for k, v in value.items()}
 
     if isinstance(value, list):
-        return [serialize_value(v, key) for v in value]
+        items = [serialize_value(v, key) for v in value]
+        # Sort vlan_trunks for stable comparison (order may differ between API and playbook)
+        if key == "vlan_trunks":
+            try:
+                items = sorted(items, key=lambda x: int(x) if isinstance(x, (str, int)) and str(x).isdigit() else x)
+            except (TypeError, ValueError):
+                pass
+        return items
 
     if hasattr(value, "vlan_id"):
         return str(value.vlan_id)
@@ -609,6 +626,17 @@ def get_argument_spec():
 
 IGNORED_DIFF_KEYS = ["state", "interface", "enforce_vlan_trunks"]
 
+# pyaoscx Interface uses "vlan_tag" for both access VLAN and native VLAN; Ansible params use vlan_access / native_vlan_id
+PARAM_TO_ATTR = {"vlan_access": "vlan_tag", "native_vlan_id": "vlan_tag"}
+
+# Only compare params that are actually applied in the non-check path (avoids false "changed" for params with no interface attribute)
+CHECK_MODE_COMPARE_KEYS = frozenset([
+    "description", "vlan_mode", "vlan_access", "vlan_trunks", "trunk_allowed_all",
+    "native_vlan_id", "native_vlan_tag",
+    "port_access_allow_flood_traffic", "port_access_clients_limit", "port_access_onboarding_precedence",
+    "mtu",
+])
+
 
 
 def main():
@@ -745,6 +773,10 @@ def main():
             # need to compare if there are any changes after deleting
             result["changed"] = prev_intf_attrs != curr_intf_attrs
         ansible_module.exit_json(**result)
+
+    # Load current interface state from switch (required for check_mode comparison and vlan_trunks logic)
+    interface.get()
+
     vlan_tag = None
     if vlan_access is not None:
         vlan_tag = vlan_access
@@ -796,11 +828,12 @@ def main():
 
         GENERIC_SKIP = set(IGNORED_DIFF_KEYS) | {"mac_auth", "dot1x"}
 
-        # 1) Generic Fields (wie gehabt)
+        # 1) Generic Fields: only compare keys we actually set in the non-check path (mirrors apply logic)
         for key, desired_value in ansible_module.params.items():
-            if key in GENERIC_SKIP or desired_value is None:
+            if key not in CHECK_MODE_COMPARE_KEYS or key in GENERIC_SKIP or desired_value is None:
                 continue
-            current_value = getattr(interface, key, None)
+            attr_name = PARAM_TO_ATTR.get(key, key)
+            current_value = getattr(interface, attr_name, None)
             current_serialized = serialize_value(current_value, key)
             desired_serialized = serialize_value(desired_value, key)
             if current_serialized != desired_serialized:
